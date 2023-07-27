@@ -28,10 +28,13 @@ const (
 type FxDag struct {
 	mu        sync.RWMutex
 	fnService map[string]IService
-	initVal   *dagValue // 设置的默认值，可以手动的修改，可用于val的二级赋值。 取值优先使用val 获取，当val中没有，或者val中值为nil时使用initVal
-	val       *dagValue // 依赖项返回的数据，无法手动设置
-	wList     []operatorCollection
-	stopFlag  byte // 是否停止使用标识
+	// 设置的默认值，可以手动的修改，可用于val的二级赋值。 取值优先使用val 获取，当val中没有，或者val中值为nil时使用initVal
+	initVal *dagValue
+	// 依赖项返回的数据，无法手动设置
+	val   *dagValue
+	wList []operatorCollection
+	// 是否停止使用标识
+	stopFlag byte
 }
 
 // DefaultDag 是一个默认的 FxDag
@@ -60,8 +63,8 @@ func (f *FxDag) InitParamsByName(name string, v any) error {
 	if err != nil {
 		return err
 	}
-	f.seInitVal(name, v)
-	return nil
+
+	return f.seInitVal(name, v)
 }
 
 // InitParams 设置初始值
@@ -70,8 +73,8 @@ func (f *FxDag) InitParams(v any) error {
 	if err != nil {
 		return err
 	}
-	f.seInitVal(name, v)
-	return nil
+
+	return f.seInitVal(name, v)
 }
 
 // Clear 清空队列
@@ -209,13 +212,14 @@ loop:
 	return ors, nil
 }
 
-func (f *FxDag) seInitVal(name string, v any) {
-	f.initVal.set(name, v)
+func (f *FxDag) seInitVal(name string, v any) error {
+	return f.initVal.set(name, v)
+
 }
 
 // setVal 设置值
-func (f *FxDag) setVal(name string, v any) {
-	f.val.set(name, v)
+func (f *FxDag) setVal(name string, v any) error {
+	return f.val.set(name, v)
 }
 
 // getVal 获取值
