@@ -21,12 +21,12 @@ func callA(ctx context.Context) (*A, error) {
 	return &A{Val: "A"}, nil
 }
 
-func callC(ctx context.Context, b *A) {
+func callC(ctx context.Context, b *B) {
 	return
 }
 
-func callB(ctx context.Context, a *A) error {
-	return nil
+func callB(ctx context.Context, a *A) (*B, error) {
+	return &B{Val: "B"}, nil
 }
 
 func TestFxDag_Draw(t *testing.T) {

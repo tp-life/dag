@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-
-	"golang.org/x/sync/errgroup"
 )
 
 // FxOp 操作符
@@ -107,7 +105,7 @@ func (f *FxDag) Execute(ctx context.Context) error {
 	if len(f.wList) == 0 {
 		return nil
 	}
-	errGo := errgroup.Group{}
+	errGo := NewSafeGo()
 	for _, v := range f.wList {
 		if len(v.handlers) == 0 {
 			continue
@@ -118,9 +116,7 @@ func (f *FxDag) Execute(ctx context.Context) error {
 		for _, svc := range v.handlers {
 			fs := svc
 			errGo.Go(func() error {
-				return SafeFn(func() error {
-					return fs.execute(ctx, f)
-				})
+				return fs.execute(ctx, f)
 			})
 		}
 		if err := errGo.Wait(); err != nil {

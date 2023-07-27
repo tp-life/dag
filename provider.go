@@ -5,17 +5,6 @@ import (
 	"reflect"
 )
 
-// SafeFn 安全执行
-func SafeFn(fn func() error) (err error) {
-	defer func() {
-		if er := recover(); er != nil {
-			err = fmt.Errorf("panic: %v", er)
-		}
-	}()
-	err = fn()
-	return
-}
-
 // getFxConcurrenceOrDefault 获取一个服务， 当服务不存在时返回默认的服务
 func getFxConcurrenceOrDefault(i *FxDag) *FxDag {
 	if i != nil {
