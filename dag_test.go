@@ -59,6 +59,8 @@ func TestFxDag_Draw(t *testing.T) {
 		t.Log("dag Execute err ", err)
 		return
 	}
+	s, ok := LoadData[*C](dag)
+	t.Log(s, ok)
 }
 
 func TestFxDag_Execute(t *testing.T) {

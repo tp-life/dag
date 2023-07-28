@@ -33,6 +33,7 @@ func LoadDataByName[T any](f *FxDag, name string) (T, bool) {
 // WrapperDagHandler 是一个用于处理有向无环图中依赖关系的函数。
 // 它将给定函数 fn 返回的服务注册到提供的 FxDag f 中。
 // 如果调用函数时出现任何问题，或者依赖关系已经存在于 FxDag 中，则该函数返回错误。
+// NOTE:: fn 必须是一个函数
 func WrapperDagHandler[T any](f *FxDag, fn any) error {
 	// 为给定类型 T 生成一个唯一的依赖关系名称。
 	name := generateDependenceName[T]()
@@ -42,6 +43,7 @@ func WrapperDagHandler[T any](f *FxDag, fn any) error {
 // WrapperDagHandlerNoName 不提供任何被依赖数项
 // 它将给定函数 fn 返回的服务注册到提供的 FxDag f 中。
 // 如果调用函数时出现任何问题，或者依赖关系已经存在于 FxDag 中，则该函数返回错误。
+// NOTE:: fn 必须是一个函数
 func WrapperDagHandlerNoName(f *FxDag, fn any) error {
 	name := fmt.Sprintf("%p", fn)
 	return wrapperDagHandlerByName(f, name, fn, false)

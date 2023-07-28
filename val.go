@@ -28,3 +28,10 @@ func (dv *dagValue) set(key string, v any) error {
 	dv.val[key] = v
 	return nil
 }
+
+func (dv *dagValue) clear() {
+	dv.mu.Lock()
+	defer dv.mu.Unlock()
+	dv.val = make(map[string]any)
+
+}
