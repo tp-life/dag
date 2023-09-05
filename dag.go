@@ -141,6 +141,8 @@ func (f *FxDag) Draw() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	f.wList = f.wList[0:0]
+
 	fns := make(map[string]IService)
 	for k, v := range f.fnService {
 		fns[k] = v
