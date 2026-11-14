@@ -2,6 +2,7 @@ package dag
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 )
@@ -15,33 +16,54 @@ type IService interface {
 // service 用于记录依赖关系
 type service struct {
 	dependence map[string]struct{} // 依赖的参数
-	fn         any
-	produce    string // 产生的结果类型
-	pd         bool   // 是否提供依赖
+	produce    string              // 产生的结果类型
+	pd         bool                // 是否提供依赖
+	run        func(context.Context, *FxDag) (any, error)
+	reflectFn  reflect.Value
 }
 
 // newService 创建一个新的服务
-func newService(fn any, dependence map[string]struct{}, produce string, pd bool) *service {
+func newService(dependence map[string]struct{}, produce string, pd bool) *service {
 	return &service{
 		dependence: dependence,
-		fn:         fn,
 		produce:    produce,
 		pd:         pd,
 	}
 }
 
+// newReflectService 创建一个基于反射的服务
+func newReflectService(fn reflect.Value, dependence map[string]struct{}, produce string, pd bool) *service {
+	s := newService(dependence, produce, pd)
+	s.reflectFn = fn
+	return s
+}
+
+// bind 使用泛型方法把强类型 handler 擦除为统一执行函数。
+// Go 1.27 之前方法不能声明自己的类型参数，这也是 serviceT[T] 存在的原因。
+func (s *service) bind[T any](handler FxHandler[T]) *service {
+	s.run = func(ctx context.Context, dag *FxDag) (any, error) {
+		return handler(ctx, dag)
+	}
+	return s
+}
+
 func (s *service) execute(ctx context.Context, dag *FxDag) error {
-	_, ok := s.fn.(reflect.Value)
-	if ok {
+	if s.reflectFn.IsValid() {
 		return s.executeReflect(ctx, dag)
 	}
-
-	_, ok = s.fn.(FxHandler[any])
-	if ok {
-		return s.executeHandler(ctx, dag)
+	if s.run == nil {
+		return errors.New("fn is not supported")
 	}
 
-	return fmt.Errorf("fn is not supported")
+	v, err := s.run(ctx, dag)
+	if err != nil {
+		return err
+	}
+	if !s.pd {
+		return nil
+	}
+	dag.setVal(s.produce, v)
+	return nil
 }
 
 func (s *service) getDependence() []string {
@@ -52,106 +74,47 @@ func (s *service) getDependence() []string {
 	return d
 }
 
-// executeHandler 用于执行handler
-func (s *service) executeHandler(ctx context.Context, dag *FxDag) error {
-	_fn, ok := s.fn.(FxHandler[any])
-	if !ok {
-		return fmt.Errorf("fn is not of type FxHandler")
-	}
-
-	v, err := _fn(ctx, dag)
-	if err != nil {
-		return err
-	}
-	if !s.pd {
-		return nil
-	}
-	return dag.val.set(s.produce, v)
-}
-
 // executeReflect 用于执行反射函数
 func (s *service) executeReflect(ctx context.Context, dag *FxDag) error {
-	_f, ok := s.fn.(reflect.Value)
-	if !ok {
-		return fmt.Errorf("fn is not of type reflect.Func")
+	if ctx == nil {
+		return fmt.Errorf("ctx is nil")
 	}
-	fType := _f.Type()
+
+	fType := s.reflectFn.Type()
 	params := make([]reflect.Value, 0, fType.NumIn())
 	params = append(params, reflect.ValueOf(ctx))
 
-	if fType.NumIn() > 1 {
-
-		for i := 1; i < fType.NumIn(); i++ {
-			if v, ok := dag.getVal(fType.In(i).String()); ok {
-				params = append(params, reflect.ValueOf(v))
-			}
+	for i := 1; i < fType.NumIn(); i++ {
+		pt := fType.In(i)
+		v, ok := dag.getVal(pt.String())
+		if !ok {
+			return fmt.Errorf("依赖项不存在:%s", pt)
 		}
-
+		if v == nil {
+			params = append(params, reflect.Zero(pt))
+			continue
+		}
+		rv := reflect.ValueOf(v)
+		if !rv.Type().AssignableTo(pt) {
+			return fmt.Errorf("依赖项类型不匹配: got %s, want %s", rv.Type(), pt)
+		}
+		params = append(params, rv)
 	}
 
 	// 调用函数
-	result := _f.Call(params)
+	result := s.reflectFn.Call(params)
 
-	// 无返回数据以及标记为不需要提供依赖
-	if fType.NumOut() == 0 || !s.pd {
-		return nil
+	// 先检查最后一个返回值（error），与是否提供依赖无关
+	if n := fType.NumOut(); n > 0 {
+		if err, ok := result[n-1].Interface().(error); ok && !isNil(err) {
+			return err
+		}
 	}
 
-	// 检测最后一个参数是否是error
-	if fType.NumOut() > 0 {
-		callErr, ok := result[fType.NumOut()-1].Interface().(error)
-		if !ok && callErr != nil {
-			return fmt.Errorf("fn %s last return params must return a error", s.produce)
-		}
-
-		if callErr != nil {
-			return callErr
-		}
-
-	}
-
-	// 取第一个值作为提供项，只有一个返回参数时必须为error类型
-	if fType.NumOut() > 1 {
+	// 取第一个值作为提供项；只有一个返回参数时它必须是 error
+	if s.pd && fType.NumOut() > 1 {
 		dag.setVal(s.produce, result[0].Interface())
 	}
 
 	return nil
-}
-
-// serviceT 用于记录依赖关系
-type serviceT[T any] struct {
-	dependence map[string]struct{} // 依赖的参数
-	fn         FxHandler[T]
-	produce    string // 产生的结果类型
-	pd         bool   // 是否提供依赖
-}
-
-// newServiceT 创建一个新的服务
-func newServiceT[T any](fn FxHandler[T], dependence map[string]struct{}, produce string, pd bool) *serviceT[T] {
-	s := serviceT[T]{
-		dependence: dependence,
-		fn:         fn,
-		produce:    produce,
-		pd:         pd,
-	}
-	return &s
-}
-
-func (s *serviceT[T]) execute(ctx context.Context, dag *FxDag) error {
-	v, err := s.fn(ctx, dag)
-	if err != nil {
-		return err
-	}
-	if !s.pd {
-		return nil
-	}
-	return dag.val.set(s.produce, v)
-}
-
-func (s *serviceT[T]) getDependence() []string {
-	d := make([]string, 0, len(s.dependence))
-	for k := range s.dependence {
-		d = append(d, k)
-	}
-	return d
 }

@@ -3,7 +3,9 @@ package dag
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 // FxOp 操作符
@@ -32,7 +34,7 @@ type FxDag struct {
 	val   *dagValue
 	wList []operatorCollection
 	// 是否停止使用标识
-	stopFlag byte
+	stopFlag atomic.Bool
 }
 
 // DefaultDag 是一个默认的 FxDag
@@ -46,77 +48,99 @@ func New() *FxDag {
 		val:       newDagValue(),
 		initVal:   newDagValue(),
 		wList:     make([]operatorCollection, 0, 10),
-		stopFlag:  0,
 	}
+}
+
+// orDefault 返回 f 本身；当 f 为 nil 时返回 DefaultDag
+func (f *FxDag) orDefault() *FxDag {
+	if f != nil {
+		return f
+	}
+	return DefaultDag
 }
 
 // Load 读取值
 func (f *FxDag) Load(name string) (any, bool) {
-	return f.getVal(name)
+	return f.orDefault().getVal(name)
 }
 
 // InitParamsByName 设置初始值
 func (f *FxDag) InitParamsByName(name string, v any) error {
-	_, err := generateName(v)
-	if err != nil {
-		return err
+	if v == nil {
+		return fmt.Errorf("value is nil")
 	}
-
-	return f.seInitVal(name, v)
+	f.orDefault().initVal.set(name, v)
+	return nil
 }
 
-// InitParams 设置初始值
-func (f *FxDag) InitParams(v any) error {
-	name, err := generateName(v)
-	if err != nil {
-		return err
+// InitParams 设置初始值。
+// 使用泛型方法的静态类型 T 生成名称，保证与 Provide[T]/LoadData[T] 一致。
+func (f *FxDag) InitParams[T any](v T) error {
+	if any(v) == nil {
+		return fmt.Errorf("value is nil")
 	}
-
-	return f.seInitVal(name, v)
+	f.orDefault().initVal.set(GenName[T](), v)
+	return nil
 }
 
-// Clear 清空队列
+// Clear 清空待执行队列与执行结果，保留 initVal（用户设置的默认值）
 func (f *FxDag) Clear() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.fnService = make(map[string]IService, 0)
+	_f := f.orDefault()
+	_f.mu.Lock()
+	defer _f.mu.Unlock()
+
+	_f.fnService = make(map[string]IService)
+	_f.wList = _f.wList[:0]
+	_f.val.clear()
+	_f.stopFlag.Store(false)
 }
 
 // Stop 停止执行
 func (f *FxDag) Stop() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.stopFlag = 1
+	f.orDefault().stopFlag.Store(true)
 }
 
 // DeleteProvider 删除依赖
 func (f *FxDag) DeleteProvider(name string) {
-	f.delete(name)
+	_f := f.orDefault()
+	_f.mu.Lock()
+	defer _f.mu.Unlock()
+
+	delete(_f.fnService, name)
+	_f.val.delete(name)
 }
 
 // Execute 执行构建的节点
 func (f *FxDag) Execute(ctx context.Context) error {
+	_f := f.orDefault()
 	// 执行后需要将停止标识清空
-	defer func() {
-		f.mu.Lock()
-		f.stopFlag = 0
-		f.mu.Unlock()
-	}()
-	if len(f.wList) == 0 {
+	defer _f.stopFlag.Store(false)
+
+	if ctx == nil {
+		return fmt.Errorf("ctx is nil")
+	}
+
+	_f.mu.RLock()
+	layers := make([]operatorCollection, len(_f.wList))
+	copy(layers, _f.wList)
+	_f.mu.RUnlock()
+
+	if len(layers) == 0 {
 		return nil
 	}
-	errGo := NewSafeGo()
-	for _, v := range f.wList {
+
+	for _, v := range layers {
 		if len(v.handlers) == 0 {
 			continue
 		}
-		if f.stopFlag > 0 {
+		if _f.stopFlag.Load() {
 			break
 		}
+		errGo := NewSafeGo()
 		for _, svc := range v.handlers {
 			fs := svc
 			errGo.Go(func() error {
-				return fs.execute(ctx, f)
+				return fs.execute(ctx, _f)
 			})
 		}
 		if err := errGo.Wait(); err != nil {
@@ -127,43 +151,34 @@ func (f *FxDag) Execute(ctx context.Context) error {
 }
 
 // Draw 绘制待执行的路径
-// 这段代码定义了一个名为Draw的方法，它属于FxDag结构体，并且使用Go语言编写。
-// 它首先检查fnService映射是否为空，如果是，则返回nil。
-// 否则，它会对互斥锁进行加锁，创建fnService映射的副本，然后进入循环。
-// 在循环内部，它使用副本调用fnsNode函数，并将返回的值分配给ors和err。
-// 如果出现错误，它会返回该错误。如果ors不为空，它会将一个operatorCollection结构体追加到wList切片中。
-// 循环结束后，它清空fnService映射并返回nil。
+// 对 fnService 做拓扑分层，每一层内的节点可以并行执行。
 func (f *FxDag) Draw() error {
-	if len(f.fnService) == 0 {
+	_f := f.orDefault()
+	_f.mu.Lock()
+	defer _f.mu.Unlock()
+
+	// 必须无条件重置：否则 Clear 后空注册会继续执行旧的 wList
+	_f.wList = _f.wList[:0]
+	if len(_f.fnService) == 0 {
 		return nil
 	}
 
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.wList = f.wList[0:0]
-
-	fns := make(map[string]IService)
-	for k, v := range f.fnService {
+	fns := make(map[string]IService, len(_f.fnService))
+	for k, v := range _f.fnService {
 		fns[k] = v
 	}
 
 	// 循环绘制层级
-	for {
-		if len(fns) == 0 {
-			break
-		}
-		// 当前顺序节点
-		ors, err := f.fnsNode(fns)
+	for len(fns) > 0 {
+		ors, err := _f.fnsNode(fns)
 		if err != nil {
 			return err
 		}
-
 		if len(ors) == 0 {
-			continue
+			// 正常情况下 fnsNode 已返回循环依赖错误，这里是防御性判断
+			return fmt.Errorf("依赖项循环依赖:%v", sortedServiceNames(fns))
 		}
-
-		f.wList = append(f.wList, operatorCollection{
+		_f.wList = append(_f.wList, operatorCollection{
 			handlers: ors,
 			op:       fxOpOr,
 		})
@@ -186,7 +201,6 @@ loop:
 				// 1、判断是否在待分配队列里面
 				// 2、如果不在待分配队列里面则判断是否在默认初始化项里面
 				// 3、如果不在初始化队列里面则说明依赖项尚未添加到待执行队列
-				// sdm 存在则说明依赖项尚未添加到待执行队列里面
 				if _, ok := sdm[d]; ok {
 					continue loop
 				}
@@ -205,61 +219,50 @@ loop:
 		delete(sdm, k)
 	}
 	if len(sdm) > 0 && len(qList) == 0 {
-		return ors, fmt.Errorf("依赖项循环依赖:%v", sdm)
+		return nil, fmt.Errorf("依赖项循环依赖:%v", sortedServiceNames(sdm))
 	}
 	return ors, nil
 }
 
-func (f *FxDag) seInitVal(name string, v any) error {
-	return f.initVal.set(name, v)
-
+// sortedServiceNames 返回排序后的服务名，保证错误信息稳定
+func sortedServiceNames(m map[string]IService) []string {
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // setVal 设置值
-func (f *FxDag) setVal(name string, v any) error {
-	return f.val.set(name, v)
+func (f *FxDag) setVal(name string, v any) {
+	f.val.set(name, v)
 }
 
-// getVal 获取值
+// getVal 获取值。
+// 优先从 val 取；当 val 中的值为 nil 时回退到 initVal；initVal 也没有时保留该 nil 值。
 func (f *FxDag) getVal(name string) (any, bool) {
-	r, ok := f.val.get(name)
-	if ok {
-		return r, true
-	}
-	return f.initVal.get(name)
-}
-
-// set 设置一个服务
-func (f *FxDag) set(name string, v IService) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.fnService[name] = v
-}
-
-// set 设置一个服务
-func (f *FxDag) delete(name string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.fnService, name)
-}
-
-// exists 判断服务是否存在
-func (f *FxDag) exists(name string) bool {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	_, ok := f.fnService[name]
-	return ok
-}
-
-// get 获取一个服务
-func (f *FxDag) get(name string) (IService, bool) {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	_s, ok := f.fnService[name]
+	v, ok := f.val.get(name)
 	if !ok {
-		return nil, false
+		return f.initVal.get(name)
 	}
-	return _s, ok
+	if !isNil(v) {
+		return v, true
+	}
+	if iv, iok := f.initVal.get(name); iok {
+		return iv, true
+	}
+	return v, true
+}
+
+// setIfAbsent 原子地检查并设置一个服务，避免并发重复注册互相覆盖
+func (f *FxDag) setIfAbsent(name string, v IService) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if _, ok := f.fnService[name]; ok {
+		return fmt.Errorf("dependence %s already exists", name)
+	}
+	f.fnService[name] = v
+	return nil
 }

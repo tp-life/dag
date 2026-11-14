@@ -1,228 +1,130 @@
 package dag
 
 import (
+	"context"
 	"fmt"
 	"reflect"
-	"sync"
+	"sync/atomic"
 )
 
-// getFxConcurrenceOrDefault 获取一个服务， 当服务不存在时返回默认的服务
-func getFxConcurrenceOrDefault(i *FxDag) *FxDag {
-	if i != nil {
-		return i
-	}
-	return DefaultDag
-}
+var (
+	errorType       = reflect.TypeFor[error]()
+	contextType     = reflect.TypeFor[context.Context]()
+	nonameServiceID atomic.Uint64
+)
 
 // LoadData 从dag里获取数据
-func LoadData[T any](f *FxDag) (T, bool) {
-	name := GenName[T]()
-	return LoadDataByName[T](f, name)
+func (f *FxDag) LoadData[T any]() (T, bool) {
+	return f.LoadDataByName[T](GenName[T]())
 }
 
 // LoadDataByName 从dag里获指定name的数据
-func LoadDataByName[T any](f *FxDag, name string) (T, bool) {
-	a, b := f.Load(name)
-	if !b {
-		v := new(T)
-		return *v, false
+func (f *FxDag) LoadDataByName[T any](name string) (T, bool) {
+	a, ok := f.orDefault().Load(name)
+	if !ok {
+		var zero T
+		return zero, false
 	}
 	v, ok := a.(T)
 	return v, ok
 }
 
-// WrapperDagHandler 是一个用于处理有向无环图中依赖关系的函数。
-// 它将给定函数 fn 返回的服务注册到提供的 FxDag f 中。
-// 如果调用函数时出现任何问题，或者依赖关系已经存在于 FxDag 中，则该函数返回错误。
-// NOTE:: fn 必须是一个函数
-func WrapperDagHandler[T any](f *FxDag, fn any) error {
-	// 为给定类型 T 生成一个唯一的依赖关系名称。
-	name := generateDependenceName[T]()
-	return wrapperDagHandlerByName(f, name, fn, true)
+// WrapHandler 注册一个任意签名的函数，并按参数类型自动装配依赖。
+// T 用于生成结果名称，并校验函数首个返回值的类型。
+// NOTE:: fn 必须是一个函数，第一个参数必须是 context.Context。
+func (f *FxDag) WrapHandler[T any](fn any) error {
+	return f.wrapHandlerByName(GenName[T](), fn, true, reflect.TypeFor[T]())
 }
 
-// WrapperDagHandlerNoName 不提供任何被依赖数项
-// 它将给定函数 fn 返回的服务注册到提供的 FxDag f 中。
-// 如果调用函数时出现任何问题，或者依赖关系已经存在于 FxDag 中，则该函数返回错误。
-// NOTE:: fn 必须是一个函数
-func WrapperDagHandlerNoName(f *FxDag, fn any) error {
-	name := fmt.Sprintf("%p", fn)
-	return wrapperDagHandlerByName(f, name, fn, false)
+// WrapHandlerNoName 注册一个不提供结果的任意签名函数
+// NOTE:: fn 必须是一个函数，第一个参数必须是 context.Context。
+func (f *FxDag) WrapHandlerNoName(fn any) error {
+	name := fmt.Sprintf("dag:noname:%d", nonameServiceID.Add(1))
+	return f.wrapHandlerByName(name, fn, false, nil)
 }
 
-// wrapperDagHandlerByName 是一个用于处理有向无环图中依赖关系的函数。
-// 它将给定函数 fn 返回的服务注册到提供的 FxDag f 中。
-// 如果调用函数时出现任何问题，或者依赖关系已经存在于 FxDag 中，则该函数返回错误。
-func wrapperDagHandlerByName(f *FxDag, name string, fn any, pd bool) error {
-
-	// 使用生成的名称调用函数，并获取服务和任何错误。
-	services, err := callFuncParams(fn, name, pd)
+func (f *FxDag) wrapHandlerByName(name string, fn any, pd bool, want reflect.Type) error {
+	services, err := callFuncParams(fn, name, pd, want)
 	if err != nil {
 		return err
 	}
-
-	// 获取 FxDag，如果不存在，则使用默认的 FxDag。
-	_f := getFxConcurrenceOrDefault(f)
-
-	// 检查 FxDag 中是否已经存在该依赖关系。
-	if _f.exists(name) {
-		return fmt.Errorf("dependence %s already exists", name)
-	}
-
-	// 在 FxDag 中设置该依赖关系的服务。
-	_f.set(name, services)
-
-	return nil
+	return f.orDefault().setIfAbsent(name, services)
 }
 
 // Provide 注册依赖关系
-func Provide[T any](f *FxDag, handler FxHandler[T], depName ...string) (err error) {
-	name := generateDependenceName[T]()
-	return ProvideByName[T](f, name, handler, depName...)
+func (f *FxDag) Provide[T any](handler FxHandler[T], depName ...string) error {
+	return f.ProvideByName(GenName[T](), handler, depName...)
 }
 
 // ProvideByName 使用给定的name注册依赖关系
-// 它接受一个FxDag指针、一个字符串name、一个FxHandler函数和一个可变参数depName（字符串类型）。返回一个错误。
-// 该函数检查FxDag中是否已经存在具有给定名称的依赖项。如果存在，则返回一个错误。否则，它使用提供的handler函数创建一个新的服务，并将其设置在具有给定名称和依赖项的FxDag中。
-func ProvideByName[T any](f *FxDag, name string, handler FxHandler[T], depName ...string) (err error) {
-	_f := getFxConcurrenceOrDefault(f)
-	if _f.exists(name) {
-		return fmt.Errorf("dependence %s already exists", name)
-	}
-	dep := make(map[string]struct{})
-	for _, v := range depName {
-		dep[v] = struct{}{}
-	}
-	_f.set(name, newServiceT[T](handler, dep, name, true))
-	return nil
+// 它接受一个字符串name、一个FxHandler函数和一个可变参数depName（字符串类型）。返回一个错误。
+// 如果依赖名已存在则返回错误；否则创建一个带依赖的服务并注册。
+func (f *FxDag) ProvideByName[T any](name string, handler FxHandler[T], depName ...string) error {
+	return f.provide(name, handler, true, depName...)
 }
 
-// ProvideByNameWithOut 使用给定的name注册依赖关系
-// 它接受一个FxDag指针、一个字符串name、一个FxHandler函数和一个可变参数depName（字符串类型）。返回一个错误。
-// 该函数检查FxDag中是否已经存在具有给定名称的依赖项。如果存在，则返回一个错误。否则，它使用提供的handler函数创建一个新的服务，并将其设置在具有给定名称和依赖项的FxDag中。
-func ProvideByNameWithOut[T any](f *FxDag, name string, handler FxHandler[T], depName ...string) (err error) {
-	_f := getFxConcurrenceOrDefault(f)
-	if _f.exists(name) {
-		return fmt.Errorf("dependence %s already exists", name)
+// ProvideByNameWithOut 使用给定的name注册依赖关系，但不把结果写入dag
+// 如果依赖名已存在则返回错误；否则创建一个带依赖的服务并注册。
+func (f *FxDag) ProvideByNameWithOut[T any](name string, handler FxHandler[T], depName ...string) error {
+	return f.provide(name, handler, false, depName...)
+}
+
+func (f *FxDag) provide[T any](name string, handler FxHandler[T], pd bool, depName ...string) error {
+	if handler == nil {
+		return fmt.Errorf("handler is nil")
 	}
-	dep := make(map[string]struct{})
+	dep := make(map[string]struct{}, len(depName))
 	for _, v := range depName {
 		dep[v] = struct{}{}
 	}
-	_f.set(name, newServiceT[T](handler, dep, name, false))
-	return nil
+	return f.orDefault().setIfAbsent(name, newService(dep, name, pd).bind(handler))
 }
 
 // GenName 获取指定类型的字符串类型
 func GenName[T any]() string {
-	return generateDependenceName[T]()
+	return reflect.TypeFor[T]().String()
 }
 
-// generateDependenceName 获取指定类型的字符串值
-func generateDependenceName[T any]() string {
-	var t T
-	// struct
-	name := fmt.Sprintf("%T", t)
-	if name != "<nil>" {
-		return name
-	}
-	// interface
-	return fmt.Sprintf("%T", new(T))
-}
-
-// generateName 获取指定类型的字符串值
-func generateName(v any) (string, error) {
-	name := fmt.Sprintf("%T", v)
-	if name != "<nil>" {
-		return name, nil
-	}
-	return "", fmt.Errorf("value is nil")
-}
-
-// callFuncParams 获取service。
-// 它接受两个参数：fn（任意类型）和produce（字符串类型）。函数首先使用反射检查fn的类型是否为函数类型。如果不是，则返回一个错误。然后，它创建了一个名为dep的空映射。
-// 该函数检查fn是否至少有一个参数。如果没有，将返回一个错误，指示fn必须具有context.Context类型的参数。
-// 如果fn至少有一个参数，则函数检查第一个参数是否为context.Context类型。如果不是，则返回一个错误。
-// 然后，函数遍历fn的剩余参数，并将它们的字符串表示添加到dep映射中。
-// 最后，函数返回调用newService函数的结果，其中将fn参数作为reflect.Value传递，将dep映射和produce参数作为参数传递，同时返回nil错误。
-func callFuncParams(fn any, produce string, pd bool) (*service, error) {
-	s, _, err := callFuncParamsAndName(fn, produce, pd)
-	return s, err
-}
-
-func callFuncParamsAndName(fn any, produce string, pd bool) (*service, string, error) {
+// callFuncParams 校验函数签名并创建service。
+// fn 必须以 context.Context 作为第一个参数，最多两个返回值；
+// 若有返回值，最后一个返回值必须实现 error；want 非nil时校验首个返回值类型。
+func callFuncParams(fn any, produce string, pd bool, want reflect.Type) (*service, error) {
 	_fn := reflect.TypeOf(fn)
-	if _fn.Kind() != reflect.Func {
-		return nil, "", fmt.Errorf("fn is not of type reflect.Func")
+	if _fn == nil || _fn.Kind() != reflect.Func {
+		return nil, fmt.Errorf("fn is not of type reflect.Func")
 	}
-	dep := make(map[string]struct{})
+	rv := reflect.ValueOf(fn)
+	if rv.IsNil() {
+		return nil, fmt.Errorf("fn is nil")
+	}
+
 	if _fn.NumIn() == 0 {
-		return nil, "", fmt.Errorf("fn has no params. fn must has context.Context params")
+		return nil, fmt.Errorf("fn has no params. fn must has context.Context params")
 	}
-	if _fn.In(0).String() != "context.Context" {
-		return nil, "", fmt.Errorf(" fn must has context.Context params")
+	if _fn.In(0) != contextType {
+		return nil, fmt.Errorf("fn must has context.Context params")
 	}
 	if _fn.NumOut() > 2 {
-		return nil, "", fmt.Errorf("fn must not have more than 2 outputs")
+		return nil, fmt.Errorf("fn must not have more than 2 outputs")
 	}
 
-	// 如果有参数，则最后一个参数需要为error 类型
-	if _fn.NumOut() > 0 && !_fn.Out(_fn.NumOut()-1).Implements(reflect.TypeOf((*error)(nil)).Elem()) {
-		return nil, "", fmt.Errorf("fn %s last return params must return a error", _fn.Name())
+	// 如果有返回值，则最后一个返回值需要实现 error 类型
+	if _fn.NumOut() > 0 && !_fn.Out(_fn.NumOut()-1).Implements(errorType) {
+		return nil, fmt.Errorf("fn %s last return params must return a error", _fn.Name())
 	}
 
-	if pd && produce == "" && _fn.NumOut() > 1 {
-		produce = _fn.Out(0).String()
+	// 泛型方法注册时校验函数返回类型与 T 一致，避免值以错误的名字写入
+	if want != nil && _fn.NumOut() > 1 && !_fn.Out(0).AssignableTo(want) {
+		return nil, fmt.Errorf("fn returns %s, want %s", _fn.Out(0), want)
 	}
 
 	if produce == "" {
-		produce = fmt.Sprintf("%p", &fn)
+		produce = fmt.Sprintf("dag:fn:%d", nonameServiceID.Add(1))
 	}
 
+	dep := make(map[string]struct{}, _fn.NumIn()-1)
 	for i := 1; i < _fn.NumIn(); i++ {
 		dep[_fn.In(i).String()] = struct{}{}
 	}
-	return newService(reflect.ValueOf(fn), dep, produce, pd), produce, nil
-}
-
-type ProviderRef struct {
-	service map[string]*service
-	mux     sync.Locker
-}
-
-func NewProviderRef() *ProviderRef {
-	return &ProviderRef{
-		mux:     &sync.Mutex{},
-		service: make(map[string]*service),
-	}
-}
-
-func (pr *ProviderRef) With(fn any, pdy bool) *ProviderRef {
-	// 使用生成的名称调用函数，并获取服务和任何错误。
-	services, name, err := callFuncParamsAndName(fn, "", pdy)
-	if err != nil {
-		return pr
-	}
-
-	pr.mux.Lock()
-	defer pr.mux.Unlock()
-	pr.service[name] = services
-	return pr
-}
-
-func (pr *ProviderRef) Result(f *FxDag) error {
-	pr.mux.Lock()
-	defer pr.mux.Unlock()
-	// 获取 FxDag，如果不存在，则使用默认的 FxDag。
-	_f := getFxConcurrenceOrDefault(f)
-	for n, v := range pr.service {
-		// 检查 FxDag 中是否已经存在该依赖关系。
-		if _f.exists(n) {
-			return fmt.Errorf("dependence %s already exists", n)
-		}
-		// 在 FxDag 中设置该依赖关系的服务。
-		_f.set(n, v)
-	}
-
-	return nil
+	return newReflectService(rv, dep, produce, pd), nil
 }
