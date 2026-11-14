@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `Plan.Graph()`：返回结构化依赖图快照（节点、层级、依赖边）。
+- `Plan.DOT()`：导出 Graphviz DOT，可直接渲染为 SVG/PNG。
+
 ## v2.0.0 - 2026-11-14
 
 ### Added

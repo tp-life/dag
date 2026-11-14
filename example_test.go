@@ -193,3 +193,32 @@ func ExampleKey() {
 	// *github.com/tp-life/dag/v2.exampleA
 	// a
 }
+
+// 导出 Graphviz DOT 依赖图
+func ExamplePlan_DOT() {
+	b := NewBuilder()
+	b.ProvideNamed("a", func(ctx context.Context, _ *State) (*exampleA, error) {
+		return &exampleA{}, nil
+	})
+	b.ProvideNamed("b", func(ctx context.Context, _ *State) (*exampleB, error) {
+		return &exampleB{}, nil
+	}, NameKey("a"))
+
+	plan, err := b.Build()
+	if err != nil {
+		fmt.Println("build:", err)
+		return
+	}
+	fmt.Print(plan.DOT())
+
+	// Output:
+	// digraph dag {
+	//   rankdir=LR;
+	//   node [shape=box];
+	//   { rank=same; n0; }
+	//   { rank=same; n1; }
+	//   n0 [label="a\nlayer 0"];
+	//   n1 [label="b\nlayer 1"];
+	//   n0 -> n1;
+	// }
+}

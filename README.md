@@ -157,6 +157,25 @@ go test -run '^$' -bench . -benchmem ./...
 
 包含 typed、reflection、并行运行、100 节点链式构建与执行的 benchmark。
 
+## 查看依赖图
+
+`Plan.Graph()` 返回结构化快照，`Plan.DOT()` 导出 Graphviz：
+
+```go
+for _, node := range plan.Graph().Nodes {
+    fmt.Println(node.Layer, node.Key, node.Deps)
+}
+
+dot := plan.DOT()
+os.WriteFile("dag.dot", []byte(dot), 0o644)
+```
+
+```bash
+dot -Tsvg dag.dot -o dag.svg
+```
+
+节点按 layer/key 排序，同一层使用 `rank=same` 对齐；输出是确定性的，可直接用于 diff。
+
 ## 从 v2 迁移
 
 - 模块路径改为 `github.com/tp-life/dag/v2`。
