@@ -63,7 +63,8 @@ func (f *FxDag) ProvideByName[T any](name string, handler FxHandler[T], depName 
 	return f.provide(name, handler, true, depName...)
 }
 
-// ProvideByNameWithOut 使用给定的name注册依赖关系，但不把结果写入dag
+// ProvideByNameWithOut 使用给定的name注册依赖关系，但不把结果写入dag。
+// 该服务不能作为其他服务的依赖（除非 initVal 提供了同名值）。
 // 如果依赖名已存在则返回错误；否则创建一个带依赖的服务并注册。
 func (f *FxDag) ProvideByNameWithOut[T any](name string, handler FxHandler[T], depName ...string) error {
 	return f.provide(name, handler, false, depName...)
@@ -116,10 +117,6 @@ func callFuncParams(fn any, produce string, pd bool, want reflect.Type) (*servic
 	// 泛型方法注册时校验函数返回类型与 T 一致，避免值以错误的名字写入
 	if want != nil && _fn.NumOut() > 1 && !_fn.Out(0).AssignableTo(want) {
 		return nil, fmt.Errorf("fn returns %s, want %s", _fn.Out(0), want)
-	}
-
-	if produce == "" {
-		produce = fmt.Sprintf("dag:fn:%d", nonameServiceID.Add(1))
 	}
 
 	dep := make(map[string]struct{}, _fn.NumIn()-1)

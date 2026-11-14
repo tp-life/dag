@@ -47,3 +47,8 @@ _ = d.WrapHandlerNoName(func(ctx context.Context, b *B) {
 - 需要 Go 1.27+（方法级类型参数）。
 - `Provide` / `Draw` / `Execute` / `Clear` 之间不保证并发安全；`Stop` 可并发调用。
 - `Clear` 清空注册、队列与执行结果，保留 `InitParams` 设置的默认值。
+- `ProvideByNameWithOut` 注册的服务不会写入值，不能作为其他服务的依赖（除非同名 `initVal` 存在）。
+- `Draw` 会校验依赖的生产者是否真正产出值；例如依赖一个 `WithOut` 服务会直接报错。
+- 执行错误会以 `dag: service <name>: ...` 包装，可用 `errors.Is/As` 判断底层错误。
+- `Stop` 会取消本次执行的 context；handler 应监听 `ctx.Done()` 以尽快返回。
+- 层内任一服务返回错误会取消同层其他服务；层与层之间串行。

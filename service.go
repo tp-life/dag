@@ -7,10 +7,11 @@ import (
 	"reflect"
 )
 
-// IService 执行器
-type IService interface {
+// iservice 执行器（包内接口）
+type iservice interface {
 	execute(ctx context.Context, dag *FxDag) error
 	getDependence() []string
+	produces() bool
 }
 
 // service 用于记录依赖关系
@@ -47,7 +48,14 @@ func (s *service) bind[T any](handler FxHandler[T]) *service {
 	return s
 }
 
-func (s *service) execute(ctx context.Context, dag *FxDag) error {
+// execute 执行服务；错误统一带上服务名，便于定位和 errors.Is/As 判断。
+func (s *service) execute(ctx context.Context, dag *FxDag) (err error) {
+	defer func() {
+		if err != nil {
+			err = fmt.Errorf("dag: service %s: %w", s.produce, err)
+		}
+	}()
+
 	if s.reflectFn.IsValid() {
 		return s.executeReflect(ctx, dag)
 	}
@@ -55,9 +63,9 @@ func (s *service) execute(ctx context.Context, dag *FxDag) error {
 		return errors.New("fn is not supported")
 	}
 
-	v, err := s.run(ctx, dag)
-	if err != nil {
-		return err
+	v, runErr := s.run(ctx, dag)
+	if runErr != nil {
+		return runErr
 	}
 	if !s.pd {
 		return nil
@@ -72,6 +80,17 @@ func (s *service) getDependence() []string {
 		d = append(d, k)
 	}
 	return d
+}
+
+// produces 表示该服务执行后是否会向 dag 写入值
+func (s *service) produces() bool {
+	if !s.pd {
+		return false
+	}
+	if s.reflectFn.IsValid() {
+		return s.reflectFn.Type().NumOut() > 1
+	}
+	return s.run != nil
 }
 
 // executeReflect 用于执行反射函数

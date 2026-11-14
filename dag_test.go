@@ -2,6 +2,8 @@ package dag
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -129,13 +131,13 @@ func TestWrapHandlerNoNamePropagatesError(t *testing.T) {
 	if err := dag.Draw(); err != nil {
 		t.Fatalf("Draw err: %v", err)
 	}
-	if err := dag.Execute(context.Background()); err != context.Canceled {
+	if err := dag.Execute(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Execute err = %v; want context.Canceled", err)
 	}
 }
 
-// TestReflectMissingDependencyReturnsError 回归：缺依赖时返回明确错误而不是 reflect.Call panic。
-func TestReflectMissingDependencyReturnsError(t *testing.T) {
+// TestNonProducingDependencyFailsDraw 回归：依赖必须由真正产出值的服务提供。
+func TestNonProducingDependencyFailsDraw(t *testing.T) {
 	dag := New()
 
 	// 以 *A 的类型名注册，但 pd=false，不会写入值
@@ -149,15 +151,14 @@ func TestReflectMissingDependencyReturnsError(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("WrapHandler err: %v", err)
 	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
-	}
 
-	err := dag.Execute(context.Background())
+	err := dag.Draw()
 	if err == nil {
-		t.Fatal("Execute err = nil; want missing dependency error")
+		t.Fatal("Draw err = nil; want non-producing dependency error")
 	}
-	t.Logf("Execute err = %v", err)
+	if !strings.Contains(err.Error(), "不提供值") {
+		t.Fatalf("Draw err = %v; want non-producing dependency error", err)
+	}
 }
 
 // TestClearResetsDrawQueue 回归：Clear 后 Draw/Execute 不能执行旧队列。
@@ -339,5 +340,158 @@ func TestDeleteProviderClearsValue(t *testing.T) {
 	dag.DeleteProvider(GenName[*A]())
 	if _, ok := dag.LoadData[*A](); ok {
 		t.Fatal("LoadData[*A] after delete = true; want false")
+	}
+}
+
+// TestExecuteHonorsContextCancel 验证父 context 取消能传递给 handler 并返回。
+func TestExecuteHonorsContextCancel(t *testing.T) {
+	dag := New()
+	started := make(chan struct{})
+
+	if err := dag.WrapHandlerNoName(func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}); err != nil {
+		t.Fatalf("WrapHandlerNoName err: %v", err)
+	}
+	if err := dag.Draw(); err != nil {
+		t.Fatalf("Draw err: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- dag.Execute(ctx)
+	}()
+
+	<-started
+	cancel()
+
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Execute err = %v; want context.Canceled", err)
+	}
+}
+
+// TestSafeFnPanicStack 验证 panic 被转换为带堆栈的 error。
+func TestSafeFnPanicStack(t *testing.T) {
+	err := SafeFn(func() error {
+		panic("boom")
+	})
+	if err == nil || !strings.Contains(err.Error(), "panic: boom") {
+		t.Fatalf("SafeFn err = %v; want panic error", err)
+	}
+	if !strings.Contains(err.Error(), "goroutine") {
+		t.Fatalf("SafeFn err missing stack trace: %v", err)
+	}
+}
+
+func TestNewSafeGo(t *testing.T) {
+	g := NewSafeGo()
+	g.Go(func() error { return nil })
+	if err := g.Wait(); err != nil {
+		t.Fatalf("Wait err = %v; want nil", err)
+	}
+
+	g = NewSafeGo()
+	g.Go(func() error { panic("boom") })
+	if err := g.Wait(); err == nil {
+		t.Fatal("Wait err = nil; want panic error")
+	}
+}
+
+// TestCallFuncParamsValidation 覆盖反射注册的参数校验分支。
+func TestCallFuncParamsValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		fn   any
+	}{
+		{"nil", nil},
+		{"not func", 1},
+		{"typed nil func", (func(context.Context) error)(nil)},
+		{"no params", func() error { return nil }},
+		{"wrong first param", func(int) error { return nil }},
+		{"too many outputs", func(context.Context) (int, int, error) { return 0, 0, nil }},
+		{"last not error", func(context.Context) int { return 0 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := callFuncParams(tc.fn, "x", true, nil); err == nil {
+				t.Fatalf("callFuncParams(%v) err = nil; want error", tc.fn)
+			}
+		})
+	}
+
+	// 只有 error 返回值：合法，但不产出值
+	svc, err := callFuncParams(func(context.Context) error { return nil }, "x", true, nil)
+	if err != nil {
+		t.Fatalf("callFuncParams error-only err: %v", err)
+	}
+	if svc.produces() {
+		t.Fatal("error-only service produces = true; want false")
+	}
+
+	// (T, error)：合法且产出值
+	svc, err = callFuncParams(func(context.Context) (*A, error) { return nil, nil }, "y", true, nil)
+	if err != nil {
+		t.Fatalf("callFuncParams (T,error) err: %v", err)
+	}
+	if !svc.produces() {
+		t.Fatal("(T,error) service produces = false; want true")
+	}
+}
+
+func TestIsNil(t *testing.T) {
+	var p *A
+	var m map[string]int
+	var s []int
+	var fn func()
+
+	cases := []struct {
+		name string
+		v    any
+		want bool
+	}{
+		{"nil", nil, true},
+		{"typed nil pointer", p, true},
+		{"typed nil map", m, true},
+		{"typed nil slice", s, true},
+		{"typed nil func", fn, true},
+		{"non-nil pointer", &A{}, false},
+		{"zero int", 0, false},
+		{"empty string", "", false},
+	}
+	for _, tc := range cases {
+		if got := isNil(tc.v); got != tc.want {
+			t.Errorf("isNil(%s) = %v; want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestGetValPrecedence(t *testing.T) {
+	dag := New()
+
+	if err := dag.InitParamsByName("k", "init"); err != nil {
+		t.Fatalf("InitParamsByName err: %v", err)
+	}
+	if v, ok := dag.getVal("k"); !ok || v != "init" {
+		t.Fatalf("getVal(k) = %v, %v; want init, true", v, ok)
+	}
+
+	dag.setVal("k", "run")
+	if v, ok := dag.getVal("k"); !ok || v != "run" {
+		t.Fatalf("getVal(k) = %v, %v; want run, true", v, ok)
+	}
+
+	// val 为 nil 时回退到 initVal
+	dag.setVal("k", (*A)(nil))
+	if v, ok := dag.getVal("k"); !ok || v != "init" {
+		t.Fatalf("getVal(k) = %v, %v; want init, true", v, ok)
+	}
+
+	// initVal 也没有时保留 nil 值
+	dag.setVal("k2", (*A)(nil))
+	if v, ok := dag.getVal("k2"); !ok || !isNil(v) {
+		t.Fatalf("getVal(k2) = %v, %v; want typed nil, true", v, ok)
 	}
 }
