@@ -3,6 +3,7 @@ package dag
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,426 +19,461 @@ type B struct {
 }
 
 type C struct {
-	c string
+	Val string
 }
 
-// namedInterface 用于验证接口类型的名称生成
+// namedInterface 用于验证接口类型 key
 type namedInterface interface {
 	Name() string
 }
 
-func callA(ctx context.Context) (*A, error) {
-	return &A{Val: "A"}, nil
-}
+func TestKeyNamespaces(t *testing.T) {
+	tk := TypeKey[*A]()
+	nk := NameKey(tk.String())
 
-func callC(ctx context.Context, b *B) {
-	_ = b
-}
-
-func callB(ctx context.Context, a *A) (*B, error) {
-	return &B{Val: a.Val}, nil
-}
-
-func TestFxDag_Draw(t *testing.T) {
-	dag := New()
-
-	if err := dag.WrapHandlerNoName(callB); err != nil {
-		t.Fatalf("WrapHandlerNoName err: %v", err)
+	if tk == nk {
+		t.Fatal("type key and name key must be distinct")
 	}
-	if err := dag.WrapHandler[*A](callA); err != nil {
-		t.Fatalf("WrapHandler A err: %v", err)
+	if !tk.IsType() || nk.IsType() {
+		t.Fatal("IsType mismatch")
 	}
-	if err := dag.WrapHandler[*B](callB); err != nil {
-		t.Fatalf("WrapHandler B err: %v", err)
+	if got, want := tk.String(), "*dag.A"; got != want {
+		t.Fatalf("TypeKey[*A].String() = %q; want %q", got, want)
 	}
-	if err := dag.WrapHandler[*C](callC); err != nil {
-		t.Fatalf("WrapHandler C err: %v", err)
+	if got, want := TypeKey[namedInterface]().String(), "dag.namedInterface"; got != want {
+		t.Fatalf("TypeKey[namedInterface].String() = %q; want %q", got, want)
 	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
-	}
-	if err := dag.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute err: %v", err)
-	}
-
-	b, ok := dag.LoadData[*B]()
-	if !ok || b == nil || b.Val != "A" {
-		t.Fatalf("LoadData[*B] = %v, %v; want &B{Val: \"A\"}, true", b, ok)
+	if !(Key{}).IsZero() {
+		t.Fatal("zero Key.IsZero() = false")
 	}
 }
 
-func TestFxDag_Execute(t *testing.T) {
-	dag := New()
-
-	if err := dag.WrapHandler[*A](callA); err != nil {
-		t.Fatalf("WrapHandler A err: %v", err)
-	}
-	if err := dag.WrapHandler[*B](callB); err != nil {
-		t.Fatalf("WrapHandler B err: %v", err)
-	}
-	if err := dag.WrapHandler[*C](callC); err != nil {
-		t.Fatalf("WrapHandler C err: %v", err)
-	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
-	}
-	if err := dag.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute err: %v", err)
-	}
-}
-
-func TestFxDag_ExecuteHandler(t *testing.T) {
-	dag := New()
-
-	if err := dag.ProvideByName("A", func(ctx context.Context, _ *FxDag) (*A, error) {
+func TestBuilderBuildTyped(t *testing.T) {
+	b := NewBuilder()
+	b.Provide(func(ctx context.Context, _ *State) (*A, error) {
 		return &A{Val: "A"}, nil
-	}); err != nil {
-		t.Fatalf("ProvideByName A err: %v", err)
-	}
-
-	err := dag.ProvideByName("B", func(ctx context.Context, d *FxDag) (*B, error) {
-		a, ok := d.LoadDataByName[*A]("A")
+	})
+	b.Provide(func(ctx context.Context, s *State) (*B, error) {
+		a, ok := s.LoadData[*A]()
 		if !ok {
-			return nil, context.Canceled
+			return nil, errors.New("A missing")
 		}
 		return &B{Val: a.Val}, nil
-	}, "A")
+	}, TypeKey[*A]())
+
+	plan, err := b.Build()
 	if err != nil {
-		t.Fatalf("ProvideByName B err: %v", err)
+		t.Fatalf("Build err: %v", err)
+	}
+	if got := plan.Layers(); got != 2 {
+		t.Fatalf("plan.Layers() = %d; want 2", got)
 	}
 
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run err: %v", err)
 	}
-	if err := dag.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute err: %v", err)
-	}
-
-	b, ok := dag.LoadDataByName[*B]("B")
-	if !ok || b == nil || b.Val != "A" {
-		t.Fatalf("LoadDataByName[*B] = %v, %v; want &B{Val: \"A\"}, true", b, ok)
+	bv, ok := result.Get[*B]()
+	if !ok || bv == nil || bv.Val != "A" {
+		t.Fatalf("Get[*B] = %v, %v; want &B{Val: \"A\"}", bv, ok)
 	}
 }
 
-// TestWrapHandlerNoNamePropagatesError 回归：pd=false 时不能吞掉 handler 的 error。
-func TestWrapHandlerNoNamePropagatesError(t *testing.T) {
-	dag := New()
-
-	if err := dag.WrapHandlerNoName(func(ctx context.Context) error {
-		return context.Canceled
-	}); err != nil {
-		t.Fatalf("WrapHandlerNoName err: %v", err)
-	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
-	}
-	if err := dag.Execute(context.Background()); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Execute err = %v; want context.Canceled", err)
-	}
-}
-
-// TestNonProducingDependencyFailsDraw 回归：依赖必须由真正产出值的服务提供。
-func TestNonProducingDependencyFailsDraw(t *testing.T) {
-	dag := New()
-
-	// 以 *A 的类型名注册，但 pd=false，不会写入值
-	if err := dag.ProvideByNameWithOut(GenName[*A](), func(ctx context.Context, _ *FxDag) (*A, error) {
+func TestProvideNamed(t *testing.T) {
+	b := NewBuilder()
+	b.ProvideNamed("a", func(ctx context.Context, _ *State) (*A, error) {
 		return &A{Val: "A"}, nil
-	}); err != nil {
-		t.Fatalf("ProvideByNameWithOut err: %v", err)
-	}
-	if err := dag.WrapHandler[*B](func(ctx context.Context, a *A) (*B, error) {
+	})
+	b.ProvideNamed("b", func(ctx context.Context, s *State) (*B, error) {
+		a, ok := s.LoadDataByName[*A]("a")
+		if !ok {
+			return nil, errors.New("a missing")
+		}
 		return &B{Val: a.Val}, nil
-	}); err != nil {
-		t.Fatalf("WrapHandler err: %v", err)
+	}, NameKey("a"))
+
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
+	}
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run err: %v", err)
 	}
 
-	err := dag.Draw()
-	if err == nil {
-		t.Fatal("Draw err = nil; want non-producing dependency error")
+	bv, ok := result.GetNamed[*B]("b")
+	if !ok || bv == nil || bv.Val != "A" {
+		t.Fatalf("GetNamed[*B](b) = %v, %v; want &B{Val: \"A\"}", bv, ok)
 	}
-	if !strings.Contains(err.Error(), "不提供值") {
-		t.Fatalf("Draw err = %v; want non-producing dependency error", err)
+	if _, ok := result.Get[*B](); ok {
+		t.Fatal("Get[*B] found a named-only value")
 	}
 }
 
-// TestClearResetsDrawQueue 回归：Clear 后 Draw/Execute 不能执行旧队列。
-func TestClearResetsDrawQueue(t *testing.T) {
-	dag := New()
-	var n atomic.Int32
-
-	if err := dag.WrapHandlerNoName(func(ctx context.Context) {
-		n.Add(1)
-	}); err != nil {
-		t.Fatalf("WrapHandlerNoName err: %v", err)
-	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
-	}
-	if err := dag.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute err: %v", err)
-	}
-	if got := n.Load(); got != 1 {
-		t.Fatalf("handler ran %d times; want 1", got)
-	}
-
-	dag.Clear()
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw after Clear err: %v", err)
-	}
-	if err := dag.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute after Clear err: %v", err)
-	}
-	if got := n.Load(); got != 1 {
-		t.Fatalf("handler ran %d times after Clear; want 1", got)
-	}
-}
-
-// TestGenNameInterface 回归：接口类型名不能带指针前缀。
-func TestGenNameInterface(t *testing.T) {
-	if got, want := GenName[namedInterface](), "dag.namedInterface"; got != want {
-		t.Fatalf("GenName[namedInterface]() = %q; want %q", got, want)
-	}
-}
-
-// TestInitValFallbackOnNil 回归：val 中的 nil 值应回退到 initVal。
-func TestInitValFallbackOnNil(t *testing.T) {
-	dag := New()
-
-	if err := dag.InitParams(&A{Val: "init"}); err != nil {
-		t.Fatalf("InitParams err: %v", err)
-	}
-	if err := dag.Provide(func(ctx context.Context, _ *FxDag) (*A, error) {
-		return nil, nil
-	}); err != nil {
-		t.Fatalf("Provide err: %v", err)
-	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
-	}
-	if err := dag.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute err: %v", err)
-	}
-
-	a, ok := dag.LoadData[*A]()
-	if !ok || a == nil || a.Val != "init" {
-		t.Fatalf("LoadData[*A] = %v, %v; want init value", a, ok)
-	}
-}
-
-// TestNilHandlerReturnsError 回归：nil handler 应返回错误而不是崩溃。
-func TestNilHandlerReturnsError(t *testing.T) {
-	dag := New()
-
-	if err := dag.WrapHandler[*A](nil); err == nil {
-		t.Fatal("WrapHandler(nil) err = nil; want error")
-	}
-	if err := dag.WrapHandlerNoName(nil); err == nil {
-		t.Fatal("WrapHandlerNoName(nil) err = nil; want error")
-	}
-
-	var handler FxHandler[*A]
-	if err := dag.Provide(handler); err == nil {
-		t.Fatal("Provide(nil) err = nil; want error")
-	}
-}
-
-// TestWrapHandlerRejectsWrongReturnType 回归：返回类型与 T 不一致时必须报错。
-func TestWrapHandlerRejectsWrongReturnType(t *testing.T) {
-	dag := New()
-
-	if err := dag.WrapHandler[*A](callB); err == nil {
-		t.Fatal("WrapHandler[*A](callB) err = nil; want type mismatch error")
-	}
-}
-
-// TestProvideDuplicateConcurrent 回归：并发注册同名依赖只能有一个成功。
-func TestProvideDuplicateConcurrent(t *testing.T) {
-	dag := New()
-	var wg sync.WaitGroup
-	var success atomic.Int32
-
-	for i := 0; i < 16; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			err := dag.ProvideByName("same", func(ctx context.Context, _ *FxDag) (*A, error) {
-				return &A{}, nil
-			})
-			if err == nil {
-				success.Add(1)
-			}
-		}()
-	}
-	wg.Wait()
-
-	if got := success.Load(); got != 1 {
-		t.Fatalf("successful registrations = %d; want 1", got)
-	}
-}
-
-// TestStopDuringExecute 回归：Stop 可并发调用，且应阻止后续层执行。
-func TestStopDuringExecute(t *testing.T) {
-	dag := New()
-	started := make(chan struct{})
-	release := make(chan struct{})
-	var nextRan atomic.Bool
-
-	if err := dag.WrapHandlerNoName(func(ctx context.Context) {
-		close(started)
-		<-release
-	}); err != nil {
-		t.Fatalf("WrapHandlerNoName err: %v", err)
-	}
-	if err := dag.Provide(func(ctx context.Context, _ *FxDag) (*A, error) {
-		return &A{}, nil
-	}); err != nil {
-		t.Fatalf("Provide A err: %v", err)
-	}
-	if err := dag.ProvideByName("next", func(ctx context.Context, _ *FxDag) (*B, error) {
-		nextRan.Store(true)
-		return &B{}, nil
-	}, GenName[*A]()); err != nil {
-		t.Fatalf("ProvideByName next err: %v", err)
-	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
-	}
-
-	go func() {
-		<-started
-		dag.Stop()
-		close(release)
-	}()
-
-	if err := dag.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute err: %v", err)
-	}
-	if nextRan.Load() {
-		t.Fatal("second layer ran after Stop")
-	}
-}
-
-// TestDeleteProviderClearsValue 回归：DeleteProvider 后不应再读取到旧值。
-func TestDeleteProviderClearsValue(t *testing.T) {
-	dag := New()
-
-	if err := dag.Provide(func(ctx context.Context, _ *FxDag) (*A, error) {
+func TestReflectionAutoWire(t *testing.T) {
+	b := NewBuilder()
+	b.Wrap[*A](func(ctx context.Context) (*A, error) {
 		return &A{Val: "A"}, nil
-	}); err != nil {
-		t.Fatalf("Provide err: %v", err)
+	})
+	b.Wrap[*B](func(ctx context.Context, a *A, s *State) (*B, error) {
+		if s == nil {
+			return nil, errors.New("state is nil")
+		}
+		return &B{Val: a.Val}, nil
+	})
+	b.WrapNamed[*C]("c", func(ctx context.Context, b *B) (*C, error) {
+		return &C{Val: b.Val + "-C"}, nil
+	})
+
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
 	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
-	}
-	if err := dag.Execute(context.Background()); err != nil {
-		t.Fatalf("Execute err: %v", err)
-	}
-	if _, ok := dag.LoadData[*A](); !ok {
-		t.Fatal("LoadData[*A] before delete = false; want true")
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run err: %v", err)
 	}
 
-	dag.DeleteProvider(GenName[*A]())
-	if _, ok := dag.LoadData[*A](); ok {
-		t.Fatal("LoadData[*A] after delete = true; want false")
+	bv, ok := result.Get[*B]()
+	if !ok || bv.Val != "A" {
+		t.Fatalf("Get[*B] = %v, %v", bv, ok)
+	}
+	cv, ok := result.GetNamed[*C]("c")
+	if !ok || cv.Val != "A-C" {
+		t.Fatalf("GetNamed[*C](c) = %v, %v", cv, ok)
 	}
 }
 
-// TestExecuteHonorsContextCancel 验证父 context 取消能传递给 handler 并返回。
-func TestExecuteHonorsContextCancel(t *testing.T) {
-	dag := New()
-	started := make(chan struct{})
+func TestWrapNoName(t *testing.T) {
+	var ran atomic.Bool
+	b := NewBuilder()
+	b.WrapNoName(func(ctx context.Context) {
+		ran.Store(true)
+	})
 
-	if err := dag.WrapHandlerNoName(func(ctx context.Context) error {
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
+	}
+	if _, err := plan.Run(context.Background()); err != nil {
+		t.Fatalf("Run err: %v", err)
+	}
+	if !ran.Load() {
+		t.Fatal("WrapNoName handler did not run")
+	}
+}
+
+func TestWrapStateWithAfter(t *testing.T) {
+	b := NewBuilder()
+	b.Provide(func(ctx context.Context, _ *State) (*A, error) {
+		return &A{Val: "A"}, nil
+	})
+	b.Wrap[*B](func(ctx context.Context, s *State) (*B, error) {
+		a, ok := s.LoadData[*A]()
+		if !ok {
+			return nil, errors.New("A missing")
+		}
+		return &B{Val: a.Val}, nil
+	}, TypeKey[*A]())
+
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
+	}
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run err: %v", err)
+	}
+	if bv, ok := result.Get[*B](); !ok || bv.Val != "A" {
+		t.Fatalf("Get[*B] = %v, %v", bv, ok)
+	}
+}
+
+func TestInitValue(t *testing.T) {
+	b := NewBuilder()
+	b.Init(&A{Val: "init"})
+	b.InitNamed("named", &A{Val: "named-init"})
+	b.Provide(func(ctx context.Context, s *State) (*B, error) {
+		a, ok := s.LoadData[*A]()
+		if !ok {
+			return nil, errors.New("A missing")
+		}
+		return &B{Val: a.Val}, nil
+	}, TypeKey[*A]())
+
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
+	}
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run err: %v", err)
+	}
+
+	if a, ok := result.Get[*A](); !ok || a.Val != "init" {
+		t.Fatalf("Get[*A] = %v, %v", a, ok)
+	}
+	if a, ok := result.GetNamed[*A]("named"); !ok || a.Val != "named-init" {
+		t.Fatalf("GetNamed[*A](named) = %v, %v", a, ok)
+	}
+	if bv, ok := result.Get[*B](); !ok || bv.Val != "init" {
+		t.Fatalf("Get[*B] = %v, %v", bv, ok)
+	}
+}
+
+func TestInitNilFallback(t *testing.T) {
+	b := NewBuilder()
+	b.Init(&A{Val: "init"})
+	b.Provide(func(ctx context.Context, _ *State) (*A, error) {
+		return nil, nil
+	})
+
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
+	}
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run err: %v", err)
+	}
+
+	a, ok := result.Get[*A]()
+	if !ok || a == nil || a.Val != "init" {
+		t.Fatalf("Get[*A] = %v, %v; want init value", a, ok)
+	}
+}
+
+func TestBuildMissingDependency(t *testing.T) {
+	b := NewBuilder()
+	b.Wrap[*B](func(ctx context.Context, a *A) (*B, error) {
+		return &B{Val: a.Val}, nil
+	})
+
+	if _, err := b.Build(); err == nil || !strings.Contains(err.Error(), "not found") {
+		t.Fatalf("Build err = %v; want dependency not found", err)
+	}
+}
+
+func TestBuildNonProducingDependency(t *testing.T) {
+	b := NewBuilder()
+	b.ProvideWithoutValue("a", func(ctx context.Context, _ *State) (*A, error) {
+		return &A{Val: "A"}, nil
+	})
+	b.Provide(func(ctx context.Context, _ *State) (*B, error) {
+		return &B{}, nil
+	}, NameKey("a"))
+
+	if _, err := b.Build(); err == nil || !strings.Contains(err.Error(), "not produced") {
+		t.Fatalf("Build err = %v; want dependency not produced", err)
+	}
+}
+
+func TestBuildCycle(t *testing.T) {
+	b := NewBuilder()
+	b.Provide(func(ctx context.Context, _ *State) (*A, error) {
+		return &A{}, nil
+	}, TypeKey[*B]())
+	b.Provide(func(ctx context.Context, _ *State) (*B, error) {
+		return &B{}, nil
+	}, TypeKey[*A]())
+
+	if _, err := b.Build(); err == nil || !strings.Contains(err.Error(), "cycle") {
+		t.Fatalf("Build err = %v; want dependency cycle", err)
+	}
+}
+
+func TestBuildDuplicateKey(t *testing.T) {
+	b := NewBuilder()
+	h := func(ctx context.Context, _ *State) (*A, error) {
+		return &A{}, nil
+	}
+	b.Provide(h)
+	b.Provide(h)
+
+	if _, err := b.Build(); err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("Build err = %v; want duplicate key", err)
+	}
+}
+
+func TestBuildNilHandler(t *testing.T) {
+	b := NewBuilder()
+	var h Handler[*A]
+	b.Provide(h)
+
+	if _, err := b.Build(); err == nil || !strings.Contains(err.Error(), "nil") {
+		t.Fatalf("Build err = %v; want nil handler error", err)
+	}
+}
+
+func TestBuildEmptyKey(t *testing.T) {
+	h := func(ctx context.Context, _ *State) (*A, error) { return &A{}, nil }
+
+	if _, err := NewBuilder().ProvideNamed("", h).Build(); err == nil {
+		t.Fatal("ProvideNamed with empty name: err = nil")
+	}
+	if _, err := NewBuilder().WrapNamed[*A]("", func(ctx context.Context) (*A, error) { return &A{}, nil }).Build(); err == nil {
+		t.Fatal("WrapNamed with empty name: err = nil")
+	}
+	if _, err := NewBuilder().InitNamed("", 1).Build(); err == nil {
+		t.Fatal("InitNamed with empty name: err = nil")
+	}
+}
+
+func TestBuildReflectServiceValidation(t *testing.T) {
+	want := reflect.TypeFor[*A]()
+	cases := []struct {
+		name     string
+		fn       any
+		produces bool
+	}{
+		{"nil", nil, true},
+		{"not func", 1, true},
+		{"typed nil func", (func(context.Context) (*A, error))(nil), true},
+		{"no params", func() (*A, error) { return nil, nil }, true},
+		{"wrong first param", func(int) (*A, error) { return nil, nil }, true},
+		{"too many outputs", func(context.Context) (*A, *A, error) { return nil, nil, nil }, true},
+		{"last not error", func(context.Context) (*A, *A) { return nil, nil }, true},
+		{"wrong return", func(context.Context) (*B, error) { return nil, nil }, true},
+		{"no result", func(context.Context) error { return nil }, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := buildReflectService(TypeKey[*A](), tc.fn, tc.produces, want); err == nil {
+				t.Fatalf("buildReflectService(%v) err = nil; want error", tc.fn)
+			}
+		})
+	}
+
+	if _, err := buildReflectService(NameKey("n"), func(context.Context) {}, false, nil); err != nil {
+		t.Fatalf("valid no-output fn err: %v", err)
+	}
+}
+
+func TestRunContextCancel(t *testing.T) {
+	b := NewBuilder()
+	started := make(chan struct{})
+	b.WrapNoName(func(ctx context.Context) error {
 		close(started)
 		<-ctx.Done()
 		return ctx.Err()
-	}); err != nil {
-		t.Fatalf("WrapHandlerNoName err: %v", err)
-	}
-	if err := dag.Draw(); err != nil {
-		t.Fatalf("Draw err: %v", err)
+	})
+
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		done <- dag.Execute(ctx)
+		_, err := plan.Run(ctx)
+		done <- err
 	}()
 
 	<-started
 	cancel()
 
 	if err := <-done; !errors.Is(err, context.Canceled) {
-		t.Fatalf("Execute err = %v; want context.Canceled", err)
+		t.Fatalf("Run err = %v; want context.Canceled", err)
 	}
 }
 
-// TestSafeFnPanicStack 验证 panic 被转换为带堆栈的 error。
-func TestSafeFnPanicStack(t *testing.T) {
-	err := SafeFn(func() error {
+func TestRunPanicRecovery(t *testing.T) {
+	b := NewBuilder()
+	b.WrapNoName(func(ctx context.Context) {
 		panic("boom")
 	})
+
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
+	}
+	_, err = plan.Run(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "panic: boom") {
-		t.Fatalf("SafeFn err = %v; want panic error", err)
+		t.Fatalf("Run err = %v; want panic error", err)
 	}
 	if !strings.Contains(err.Error(), "goroutine") {
-		t.Fatalf("SafeFn err missing stack trace: %v", err)
+		t.Fatalf("Run err missing stack trace: %v", err)
 	}
 }
 
-func TestNewSafeGo(t *testing.T) {
-	g := NewSafeGo()
-	g.Go(func() error { return nil })
-	if err := g.Wait(); err != nil {
-		t.Fatalf("Wait err = %v; want nil", err)
+func TestResultPartialOnError(t *testing.T) {
+	b := NewBuilder()
+	b.Provide(func(ctx context.Context, _ *State) (*A, error) {
+		return &A{Val: "A"}, nil
+	})
+	b.Provide(func(ctx context.Context, _ *State) (*B, error) {
+		return nil, context.Canceled
+	}, TypeKey[*A]())
+
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
 	}
 
-	g = NewSafeGo()
-	g.Go(func() error { panic("boom") })
-	if err := g.Wait(); err == nil {
-		t.Fatal("Wait err = nil; want panic error")
+	result, err := plan.Run(context.Background())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run err = %v; want context.Canceled", err)
+	}
+	if result == nil {
+		t.Fatal("result = nil on error; want partial result")
+	}
+	if a, ok := result.Get[*A](); !ok || a.Val != "A" {
+		t.Fatalf("Get[*A] = %v, %v; want partial result", a, ok)
 	}
 }
 
-// TestCallFuncParamsValidation 覆盖反射注册的参数校验分支。
-func TestCallFuncParamsValidation(t *testing.T) {
-	cases := []struct {
-		name string
-		fn   any
-	}{
-		{"nil", nil},
-		{"not func", 1},
-		{"typed nil func", (func(context.Context) error)(nil)},
-		{"no params", func() error { return nil }},
-		{"wrong first param", func(int) error { return nil }},
-		{"too many outputs", func(context.Context) (int, int, error) { return 0, 0, nil }},
-		{"last not error", func(context.Context) int { return 0 }},
+func TestPlanConcurrentRuns(t *testing.T) {
+	b := NewBuilder()
+	b.Provide(func(ctx context.Context, _ *State) (*A, error) {
+		return &A{Val: "A"}, nil
+	})
+	plan, err := b.Build()
+	if err != nil {
+		t.Fatalf("Build err: %v", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if _, err := callFuncParams(tc.fn, "x", true, nil); err == nil {
-				t.Fatalf("callFuncParams(%v) err = nil; want error", tc.fn)
+
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result, err := plan.Run(context.Background())
+			if err != nil {
+				errs <- err
+				return
 			}
-		})
+			a, ok := result.Get[*A]()
+			if !ok || a.Val != "A" {
+				errs <- errors.New("unexpected result")
+			}
+		}()
 	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+}
 
-	// 只有 error 返回值：合法，但不产出值
-	svc, err := callFuncParams(func(context.Context) error { return nil }, "x", true, nil)
-	if err != nil {
-		t.Fatalf("callFuncParams error-only err: %v", err)
-	}
-	if svc.produces() {
-		t.Fatal("error-only service produces = true; want false")
-	}
+func TestPlanEmpty(t *testing.T) {
+	b := NewBuilder()
+	b.Init(&A{Val: "init"})
 
-	// (T, error)：合法且产出值
-	svc, err = callFuncParams(func(context.Context) (*A, error) { return nil, nil }, "y", true, nil)
+	plan, err := b.Build()
 	if err != nil {
-		t.Fatalf("callFuncParams (T,error) err: %v", err)
+		t.Fatalf("Build err: %v", err)
 	}
-	if !svc.produces() {
-		t.Fatal("(T,error) service produces = false; want true")
+	if got := plan.Layers(); got != 0 {
+		t.Fatalf("plan.Layers() = %d; want 0", got)
+	}
+	result, err := plan.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run err: %v", err)
+	}
+	if a, ok := result.Get[*A](); !ok || a.Val != "init" {
+		t.Fatalf("Get[*A] = %v, %v", a, ok)
 	}
 }
 
@@ -465,33 +501,5 @@ func TestIsNil(t *testing.T) {
 		if got := isNil(tc.v); got != tc.want {
 			t.Errorf("isNil(%s) = %v; want %v", tc.name, got, tc.want)
 		}
-	}
-}
-
-func TestGetValPrecedence(t *testing.T) {
-	dag := New()
-
-	if err := dag.InitParamsByName("k", "init"); err != nil {
-		t.Fatalf("InitParamsByName err: %v", err)
-	}
-	if v, ok := dag.getVal("k"); !ok || v != "init" {
-		t.Fatalf("getVal(k) = %v, %v; want init, true", v, ok)
-	}
-
-	dag.setVal("k", "run")
-	if v, ok := dag.getVal("k"); !ok || v != "run" {
-		t.Fatalf("getVal(k) = %v, %v; want run, true", v, ok)
-	}
-
-	// val 为 nil 时回退到 initVal
-	dag.setVal("k", (*A)(nil))
-	if v, ok := dag.getVal("k"); !ok || v != "init" {
-		t.Fatalf("getVal(k) = %v, %v; want init, true", v, ok)
-	}
-
-	// initVal 也没有时保留 nil 值
-	dag.setVal("k2", (*A)(nil))
-	if v, ok := dag.getVal("k2"); !ok || !isNil(v) {
-		t.Fatalf("getVal(k2) = %v, %v; want typed nil, true", v, ok)
 	}
 }

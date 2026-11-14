@@ -13,13 +13,6 @@ type safeGo struct {
 	eg *errgroup.Group
 }
 
-// NewSafeGo 创建一个安全的 Go
-func NewSafeGo() *safeGo {
-	return &safeGo{
-		eg: &errgroup.Group{},
-	}
-}
-
 // newSafeGoWithContext 创建一个带取消的 safeGo，并返回派生的 context
 func newSafeGoWithContext(ctx context.Context) (*safeGo, context.Context) {
 	eg, ctx := errgroup.WithContext(ctx)
