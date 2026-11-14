@@ -37,10 +37,10 @@ func TestKeyNamespaces(t *testing.T) {
 	if !tk.IsType() || nk.IsType() {
 		t.Fatal("IsType mismatch")
 	}
-	if got, want := tk.String(), "*dag.A"; got != want {
+	if got, want := tk.String(), "*github.com/tp-life/dag/v2.A"; got != want {
 		t.Fatalf("TypeKey[*A].String() = %q; want %q", got, want)
 	}
-	if got, want := TypeKey[namedInterface]().String(), "dag.namedInterface"; got != want {
+	if got, want := TypeKey[namedInterface]().String(), "github.com/tp-life/dag/v2.namedInterface"; got != want {
 		t.Fatalf("TypeKey[namedInterface].String() = %q; want %q", got, want)
 	}
 	if !(Key{}).IsZero() {

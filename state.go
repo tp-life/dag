@@ -109,7 +109,10 @@ func (s *State) set(k Key, v any) {
 
 // Result 是一次运行的结果快照；Run 返回后只读，可并发访问。
 type Result struct {
-	values map[Key]any
+	values  map[Key]any
+	errs    RunErrors
+	skipped []Key
+	report  *RunReport
 }
 
 // Load 按 Key 读取原始值
@@ -152,6 +155,36 @@ func (r *Result) Values() map[Key]any {
 		out[k] = v
 	}
 	return out
+}
+
+// Errors 返回本次运行的服务错误
+func (r *Result) Errors() RunErrors {
+	if r == nil {
+		return nil
+	}
+	out := make(RunErrors, len(r.errs))
+	copy(out, r.errs)
+	return out
+}
+
+// Skipped 返回本次运行中被跳过的服务 key
+func (r *Result) Skipped() []Key {
+	if r == nil {
+		return nil
+	}
+	out := make([]Key, len(r.skipped))
+	copy(out, r.skipped)
+	return out
+}
+
+// Report 返回本次运行的报告副本
+func (r *Result) Report() *RunReport {
+	if r == nil || r.report == nil {
+		return nil
+	}
+	out := *r.report
+	out.Services = append([]ServiceReport(nil), r.report.Services...)
+	return &out
 }
 
 // isNil 判断接口值是否为 nil（包括带类型的 nil 指针、切片、map 等）

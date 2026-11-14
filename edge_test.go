@@ -80,9 +80,9 @@ func TestTypeKeyStrings(t *testing.T) {
 		key  Key
 		want string
 	}{
-		{TypeKey[[]*A](), "[]*dag.A"},
-		{TypeKey[map[string]*A](), "map[string]*dag.A"},
-		{TypeKey[[2]*A](), "[2]*dag.A"},
+		{TypeKey[[]*A](), "[]*github.com/tp-life/dag/v2.A"},
+		{TypeKey[map[string]*A](), "map[string]*github.com/tp-life/dag/v2.A"},
+		{TypeKey[[2]*A](), "[2]*github.com/tp-life/dag/v2.A"},
 		{TypeKey[chan int](), "chan int"},
 	}
 	for _, tc := range cases {
@@ -93,7 +93,7 @@ func TestTypeKeyStrings(t *testing.T) {
 	if got := TypeKey[struct{ X int }]().String(); !strings.Contains(got, "struct") {
 		t.Errorf("unnamed struct key = %q; want contains struct", got)
 	}
-	if keySortString(TypeKey[*A]()) == keySortString(NameKey("*dag.A")) {
+	if keySortString(TypeKey[*A]()) == keySortString(NameKey(TypeKey[*A]().String())) {
 		t.Error("type key and name key sort strings must differ")
 	}
 }
@@ -119,6 +119,15 @@ func TestNilGuards(t *testing.T) {
 	}
 	if result.Values() != nil {
 		t.Fatal("nil Result.Values != nil")
+	}
+	if result.Errors() != nil {
+		t.Fatal("nil Result.Errors != nil")
+	}
+	if result.Skipped() != nil {
+		t.Fatal("nil Result.Skipped != nil")
+	}
+	if result.Report() != nil {
+		t.Fatal("nil Result.Report != nil")
 	}
 
 	var plan *Plan

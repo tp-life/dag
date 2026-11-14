@@ -6,10 +6,19 @@ import (
 	"sort"
 )
 
+// nodeDef 是不可变的图节点定义
+type nodeDef struct {
+	svc        *service
+	deps       []int // 服务依赖的节点下标（不包含 Init 提供的依赖）
+	dependents []int
+	layer      int
+}
+
 // Plan 是不可变的执行计划，可被并发多次执行。
 type Plan struct {
-	layers [][]*service
-	init   map[Key]any
+	nodes      []*nodeDef
+	init       map[Key]any
+	layerCount int
 }
 
 // Layers 返回计划的分层数量
@@ -17,13 +26,13 @@ func (p *Plan) Layers() int {
 	if p == nil {
 		return 0
 	}
-	return len(p.layers)
+	return p.layerCount
 }
 
 // Run 执行计划。
 // 每次运行拥有独立的值存储，因此同一个 Plan 可以被并发执行。
 // 出错时返回已完成部分的结果快照和错误。
-func (p *Plan) Run(ctx context.Context) (*Result, error) {
+func (p *Plan) Run(ctx context.Context, opts ...RunOption) (*Result, error) {
 	if p == nil {
 		return nil, fmt.Errorf("dag: nil plan")
 	}
@@ -31,111 +40,104 @@ func (p *Plan) Run(ctx context.Context) (*Result, error) {
 		return nil, fmt.Errorf("dag: ctx is nil")
 	}
 
-	st := newStore(p.init)
-	state := &State{store: st}
-	if err := ctx.Err(); err != nil {
-		return &Result{values: st.snapshot()}, err
-	}
-	if len(p.layers) == 0 {
-		return &Result{values: st.snapshot()}, nil
-	}
-
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	for _, layer := range p.layers {
-		if len(layer) == 0 {
-			continue
-		}
-		if err := runCtx.Err(); err != nil {
-			return &Result{values: st.snapshot()}, err
-		}
-
-		errGo, layerCtx := newSafeGoWithContext(runCtx)
-		for _, svc := range layer {
-			s := svc
-			errGo.Go(func() error {
-				return s.execute(layerCtx, state)
-			})
-		}
-		if err := errGo.Wait(); err != nil {
-			return &Result{values: st.snapshot()}, err
+	cfg := defaultRunConfig()
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
 		}
 	}
 
-	if err := ctx.Err(); err != nil {
-		return &Result{values: st.snapshot()}, err
+	state := &State{store: newStore(p.init)}
+	if len(p.nodes) == 0 {
+		result := &Result{values: state.store.snapshot(), report: &RunReport{}}
+		if err := ctx.Err(); err != nil {
+			result.errs = RunErrors{{Layer: -1, Err: err}}
+			return result, result.errs
+		}
+		return result, nil
 	}
-	return &Result{values: st.snapshot()}, nil
+
+	r := newRunner(p, cfg, state, ctx)
+	return r.run()
 }
 
-// buildLayers 使用 Kahn 算法做拓扑分层，同层节点可并行执行。
-// 按 key 排序，保证分层与错误信息稳定。
-func buildLayers(defs []*service, byKey map[Key]*service) ([][]*service, error) {
-	indeg := make(map[Key]int, len(defs))
-	dependents := make(map[Key][]Key, len(defs))
+// buildNodes 构建不可变图节点，并计算每个节点的层级。
+// 使用 Kahn 算法；Init 提供的依赖不产生图边。
+func buildNodes(defs []*service) ([]*nodeDef, int, error) {
+	index := make(map[Key]int, len(defs))
+	for i, svc := range defs {
+		index[svc.key] = i
+	}
 
-	for _, svc := range defs {
-		if _, ok := indeg[svc.key]; !ok {
-			indeg[svc.key] = 0
-		}
+	nodes := make([]*nodeDef, len(defs))
+	indeg := make([]int, len(defs))
+	for i, svc := range defs {
+		nodes[i] = &nodeDef{svc: svc, layer: -1}
 		seen := make(map[Key]struct{}, len(svc.deps))
 		for _, d := range svc.deps {
 			if _, ok := seen[d]; ok {
 				continue
 			}
 			seen[d] = struct{}{}
-			if _, ok := byKey[d]; !ok {
-				// 仅由 Init 提供的依赖不产生图边
+			j, ok := index[d]
+			if !ok {
+				// 仅由 Init 提供的依赖
 				continue
 			}
-			indeg[svc.key]++
-			dependents[d] = append(dependents[d], svc.key)
+			nodes[i].deps = append(nodes[i].deps, j)
+			indeg[i]++
+		}
+	}
+	for i, node := range nodes {
+		for _, j := range node.deps {
+			nodes[j].dependents = append(nodes[j].dependents, i)
 		}
 	}
 
-	var ready []Key
-	for k, n := range indeg {
+	ready := make([]int, 0, len(nodes))
+	for i, n := range indeg {
 		if n == 0 {
-			ready = append(ready, k)
+			ready = append(ready, i)
 		}
 	}
-	sortKeys(ready)
+	sortNodeIndices(ready, nodes)
 
-	var layers [][]*service
+	layer := 0
 	processed := 0
 	for len(ready) > 0 {
-		layer := make([]*service, 0, len(ready))
-		for _, k := range ready {
-			layer = append(layer, byKey[k])
-		}
-		layers = append(layers, layer)
-		processed += len(ready)
-
-		var next []Key
-		for _, k := range ready {
-			for _, dep := range dependents[k] {
-				indeg[dep]--
-				if indeg[dep] == 0 {
-					next = append(next, dep)
+		next := make([]int, 0, len(ready))
+		for _, i := range ready {
+			nodes[i].layer = layer
+			processed++
+			for _, j := range nodes[i].dependents {
+				indeg[j]--
+				if indeg[j] == 0 {
+					next = append(next, j)
 				}
 			}
 		}
-		sortKeys(next)
+		sortNodeIndices(next, nodes)
+		layer++
 		ready = next
 	}
 
-	if processed != len(defs) {
-		var remaining []Key
-		for k, n := range indeg {
-			if n > 0 {
-				remaining = append(remaining, k)
+	if processed != len(nodes) {
+		cycle := make([]Key, 0, len(nodes)-processed)
+		for _, node := range nodes {
+			if node.layer < 0 {
+				cycle = append(cycle, node.svc.key)
 			}
 		}
-		sortKeys(remaining)
-		return nil, fmt.Errorf("dag: dependency cycle: %v", remaining)
+		sortKeys(cycle)
+		return nil, 0, fmt.Errorf("dag: dependency cycle: %v", cycle)
 	}
-	return layers, nil
+	return nodes, layer, nil
+}
+
+func sortNodeIndices(indices []int, nodes []*nodeDef) {
+	sort.Slice(indices, func(i, j int) bool {
+		return keySortString(nodes[indices[i]].svc.key) < keySortString(nodes[indices[j]].svc.key)
+	})
 }
 
 func sortKeys(keys []Key) {

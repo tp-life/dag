@@ -190,6 +190,6 @@ func ExampleKey() {
 	fmt.Println(NameKey("a").String())
 
 	// Output:
-	// *dag.exampleA
+	// *github.com/tp-life/dag/v2.exampleA
 	// a
 }

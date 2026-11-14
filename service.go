@@ -49,14 +49,8 @@ func (s *service) bind[T any](handler Handler[T]) *service {
 	return s
 }
 
-// execute 执行服务；错误统一带上服务 key，便于定位和 errors.Is/As 判断。
-func (s *service) execute(ctx context.Context, state *State) (err error) {
-	defer func() {
-		if err != nil {
-			err = fmt.Errorf("dag: service %s: %w", s.key, err)
-		}
-	}()
-
+// execute 执行服务。错误由运行调度器包装为 *Error，附带 key 与 layer。
+func (s *service) execute(ctx context.Context, state *State) error {
 	if s.reflectFn.IsValid() {
 		return s.executeReflect(ctx, state)
 	}
@@ -64,9 +58,9 @@ func (s *service) execute(ctx context.Context, state *State) (err error) {
 		return errors.New("fn is not supported")
 	}
 
-	v, runErr := s.run(ctx, state)
-	if runErr != nil {
-		return runErr
+	v, err := s.run(ctx, state)
+	if err != nil {
+		return err
 	}
 	if !s.produces {
 		return nil

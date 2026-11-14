@@ -230,7 +230,7 @@ func (b *Builder) Build() (*Plan, error) {
 		}
 	}
 
-	layers, err := buildLayers(defs, byKey)
+	nodes, layerCount, err := buildNodes(defs)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +239,7 @@ func (b *Builder) Build() (*Plan, error) {
 	for k, v := range b.init {
 		initCopy[k] = v
 	}
-	return &Plan{layers: layers, init: initCopy}, nil
+	return &Plan{nodes: nodes, init: initCopy, layerCount: layerCount}, nil
 }
 
 func normalizeKeys(keys []Key) ([]Key, error) {
