@@ -1,6 +1,7 @@
 package dag
 
 import (
+	"maps"
 	"reflect"
 	"sync"
 )
@@ -14,9 +15,7 @@ type store struct {
 
 func newStore(init map[Key]any) *store {
 	initCopy := make(map[Key]any, len(init))
-	for k, v := range init {
-		initCopy[k] = v
-	}
+	maps.Copy(initCopy, init)
 	return &store{
 		init: initCopy,
 		val:  make(map[Key]any),
@@ -53,9 +52,7 @@ func (s *store) snapshot() map[Key]any {
 	defer s.mu.RUnlock()
 
 	out := make(map[Key]any, len(s.init)+len(s.val))
-	for k, v := range s.init {
-		out[k] = v
-	}
+	maps.Copy(out, s.init)
 	for k, v := range s.val {
 		if isNil(v) {
 			if _, ok := s.init[k]; ok {
@@ -151,9 +148,7 @@ func (r *Result) Values() map[Key]any {
 		return nil
 	}
 	out := make(map[Key]any, len(r.values))
-	for k, v := range r.values {
-		out[k] = v
-	}
+	maps.Copy(out, r.values)
 	return out
 }
 
